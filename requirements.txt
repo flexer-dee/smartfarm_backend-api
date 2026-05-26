@@ -1,0 +1,7 @@
+flask
+gunicorn
+scikit-learn
+numpy
+joblib
+paho-mqtt
+pandas
