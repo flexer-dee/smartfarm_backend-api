@@ -5,3 +5,4 @@ numpy
 joblib
 paho-mqtt
 pandas
+psycopg2-binary
