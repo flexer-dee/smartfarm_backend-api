@@ -7,3 +7,5 @@ paho-mqtt
 pandas
 psycopg2-binary
 python-dotenv
+apscheduler
+pandas
