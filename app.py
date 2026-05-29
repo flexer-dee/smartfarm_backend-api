@@ -5,28 +5,33 @@ import paho.mqtt.client as mqtt
 import json
 import os
 import psycopg2
+import pandas as pd
+from apscheduler.schedulers.background import BackgroundScheduler
+from sklearn.ensemble import IsolationForest
 from dotenv import load_dotenv
 
-# Load local environment variables from .env file (if running locally)
+# Load local environment variables
 load_dotenv()
 
 app = Flask(__name__)
 
-# Config & Setup
+# ==========================================
+# CONFIGURATION & SETUP
+# ==========================================
 DB_URL = os.environ.get('DATABASE_URL')
 MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
 MQTT_ALERT_TOPIC = "smartfarm/greenhouse/alerts"
 MQTT_ACTUATOR_TOPIC = "smartfarm/greenhouse/actuators"
 
-# Load Models Once
+# Load Models
 try:
     crop_model = joblib.load('random_forest_crop_model.pkl')
     anomaly_detector = joblib.load('isolation_forest_model.pkl')
 except Exception as e:
     print(f"⚠️ Error loading ML models: {e}")
 
-# Initialize MQTT
+# Initialize MQTT (Using VERSION2 to clear deprecation warning)
 try:
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
@@ -35,9 +40,8 @@ except Exception as e:
     print(f"⚠️ MQTT Connection Warning: {e}")
 
 # ==========================================
-# HELPER FUNCTIONS (Separation of Concerns)
+# HELPER FUNCTIONS (Logic & Database)
 # ==========================================
-
 def run_ai_inference(metrics):
     """Handles all Machine Learning predictions."""
     features = np.array([metrics])
@@ -78,9 +82,7 @@ def dispatch_mqtt_commands(action_triggered, alert_msg):
 def log_telemetry_to_db(metrics, battery_volt, predicted_crop, is_anomaly, action_triggered):
     """Handles secure insertion of state data into PostgreSQL."""
     if not DB_URL:
-        print("⚠️ Database Warning: DATABASE_URL variable not set.")
         return
-        
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
@@ -96,14 +98,51 @@ def log_telemetry_to_db(metrics, battery_volt, predicted_crop, is_anomaly, actio
         print(f"⚠️ Database Logging Error: {db_err}")
 
 # ==========================================
+# MLOps: AUTOMATED RETRAINING PIPELINE
+# ==========================================
+def retrain_anomaly_model():
+    """Pulls recent telemetry and retrains the Isolation Forest to adapt to seasonal drift."""
+    if not DB_URL:
+        return
+        
+    print("🔄 Initiating automated Anomaly Model retraining pipeline...")
+    try:
+        conn = psycopg2.connect(DB_URL)
+        query = """
+            SELECT temperature, humidity, ph, soil_moisture 
+            FROM greenhouse_telemetry 
+            WHERE timestamp >= NOW() - INTERVAL '30 days'
+        """
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+
+        if len(df) < 100:
+            print("⚠️ Not enough fresh data to retrain. Skipping MLOps cycle.")
+            return
+
+        new_isolation_forest = IsolationForest(n_estimators=100, contamination=0.05, random_state=42)
+        new_isolation_forest.fit(df)
+        joblib.dump(new_isolation_forest, 'isolation_forest_model.pkl')
+        
+        global anomaly_detector
+        anomaly_detector = new_isolation_forest
+        print("✅ MLOps Pipeline Complete: Anomaly model successfully retrained and hot-swapped.")
+
+    except Exception as e:
+        print(f"⚠️ MLOps Retraining Error: {e}")
+
+# Start Background Scheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=retrain_anomaly_model, trigger="cron", day_of_week='sun', hour=2, minute=0)
+scheduler.start()
+
+# ==========================================
 # MAIN API ROUTES
 # ==========================================
-
 @app.route('/api/telemetry', methods=['POST'])
 def process_telemetry():
     """Main webhook for incoming hardware telemetry."""
     try:
-        # 1. Parse incoming JSON payload
         data = request.get_json()
         metrics = [
             float(data['N']), float(data['P']), float(data['K']),
@@ -111,19 +150,12 @@ def process_telemetry():
         ]
         battery_volt = float(data.get('battery_volt', 12.0))
         
-        # 2. Run AI Models
         predicted_crop, is_anomaly = run_ai_inference(metrics)
-        
-        # 3. Determine Control Actions
         action_triggered, alert_msg = determine_automation_action(metrics, battery_volt, is_anomaly)
         
-        # 4. Dispatch Hardware Signals
         dispatch_mqtt_commands(action_triggered, alert_msg)
-            
-        # 5. Log Everything to Cloud Database
         log_telemetry_to_db(metrics, battery_volt, predicted_crop, is_anomaly, action_triggered)
             
-        # 6. Return standard JSON response
         return jsonify({
             "status": "processed",
             "ai_crop_recommendation": predicted_crop,
